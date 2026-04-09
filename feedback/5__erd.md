@@ -1,0 +1,361 @@
+# 🗄️ ERD (Entity Relationship Diagram)
+
+> **문서 버전:** v5.0
+> **최종 수정일:** 2026-04-09
+> **변경 사유:**
+> - ORDER_ITEM 테이블 삭제 → BOOKING에 order_id FK + original_price 흡수
+> - SEAT.status 삭제 → ACTIVE_BOOKING 테이블 분리로 확정 상태 관리
+> - BOOKING.status 추가
+> - EVENT.status, EVENT.round_number 추가
+> - SEAT.seat_number 삭제 (row_name + col_num 유지)
+> - VENUE.capacity 삭제
+
+---
+
+## 1. ERD 다이어그램
+
+```mermaid
+erDiagram
+
+    %% ====================== User Context ======================
+    USER {
+        bigint user_id PK
+        varchar email UK "로그인 아이디"
+        varchar password "BCrypt hashed"
+        varchar nickname
+        enum role "USER, ADMIN"
+        datetime created_at
+        datetime updated_at
+    }
+
+    %% ====================== Catalog Context ======================
+    VENUE {
+        bigint venue_id PK
+        varchar name "공연장명"
+        varchar address
+    }
+
+    EVENT {
+        bigint event_id PK
+        bigint venue_id FK
+        varchar title
+        enum category "CONCERT, MUSICAL, THEATER, SPORTS"
+        datetime event_date
+        int round_number "회차 번호 (다회차 표현용)"
+        enum status "ON_SALE, SOLD_OUT, CANCELLED, ENDED"
+        text description
+        varchar thumbnail_url
+        datetime created_at
+        datetime updated_at
+    }
+
+    SECTION {
+        bigint section_id PK
+        bigint event_id FK
+        varchar section_name "예: VIP석, A구역"
+        int price
+        int total_seats
+    }
+
+    SEAT {
+        bigint seat_id PK
+        bigint section_id FK
+        varchar row_name "예: A열"
+        int col_num "예: 15"
+    }
+
+    %% ====================== Booking/Order Context ======================
+    ORDER {
+        bigint order_id PK
+        bigint user_id FK
+        bigint user_coupon_id FK "사용한 쿠폰 (Nullable)"
+        int total_amount "좌석 원가 합계"
+        int discount_amount "쿠폰 할인액"
+        int final_amount "실제 결제 금액"
+        enum status "PENDING, CONFIRMED, CANCELLED, FAILED"
+        datetime created_at
+        datetime updated_at
+    }
+
+    BOOKING {
+        bigint booking_id PK
+        bigint order_id FK "소속 주문"
+        bigint user_id FK
+        bigint seat_id FK
+        bigint event_id FK "물리적 공간 내 어떤 이벤트인지 구별"
+        int original_price "결제 당시 원가 스냅샷 (ORDER_ITEM 흡수)"
+        enum status "PENDING, CONFIRMED, CANCELLED, FAILED"
+        datetime created_at
+        datetime updated_at
+    }
+
+    ACTIVE_BOOKING {
+        bigint seat_id PK "UNIQUE — 좌석당 1건만 존재"
+        bigint booking_id UK "확정된 BOOKING FK"
+    }
+
+    TICKET {
+        bigint ticket_id PK
+        bigint booking_id FK
+        varchar ticket_code UK "QR/바코드 고유값"
+        enum status "ISSUED, USED, CANCELLED"
+        datetime issued_at
+        datetime used_at "Nullable"
+    }
+
+    %% ====================== Payment Context ======================
+    PAYMENT {
+        bigint payment_id PK
+        bigint order_id FK
+        varchar payment_key UK "PG사 승인 번호"
+        int paid_amount
+        enum status "SUCCESS, FAILED, REFUNDED"
+        datetime paid_at
+        datetime refunded_at "Nullable"
+    }
+
+    PAYMENT_TRANSACTION_LOG {
+        bigint log_id PK
+        bigint payment_id FK
+        varchar tx_type "REQUEST, RESPONSE, WEBHOOK"
+        text payload "PG사 원본 데이터"
+        datetime created_at
+    }
+
+    REFUND {
+        bigint refund_id PK
+        bigint payment_id FK
+        int refund_amount "실제 환불액"
+        int penalty_amount "취소 수수료"
+        varchar reason
+        enum status "COMPLETED, FAILED"
+        datetime refunded_at
+    }
+
+    %% ====================== Promotion Context ======================
+    COUPON {
+        bigint coupon_id PK
+        varchar name
+        int discount_amount
+        int total_quantity
+        int remaining_quantity "Redis 유실 대비 (Source of Truth)"
+        datetime start_at
+        datetime expired_at
+    }
+
+    USER_COUPON {
+        bigint user_coupon_id PK
+        bigint user_id FK
+        bigint coupon_id FK
+        enum status "ISSUED, USED"
+        datetime issued_at
+        datetime used_at "Nullable"
+        bigint version "@Version (중복 사용 방지)"
+    }
+
+    %% ====================== CS Context ======================
+    CHAT_ROOM {
+        bigint chat_room_id PK
+        bigint user_id FK
+        enum status "OPEN, CLOSED"
+        datetime created_at
+        datetime updated_at
+    }
+
+    CHAT_MESSAGE {
+        bigint chat_message_id PK
+        bigint chat_room_id FK
+        bigint sender_id FK
+        enum sender_role "USER, ADMIN"
+        text content
+        datetime sent_at
+    }
+
+    %% ====================== Audit Context ======================
+    AUDIT_LOG {
+        bigint log_id PK
+        varchar entity_type "ORDER, BOOKING 등"
+        bigint entity_id
+        varchar event_type "CREATE, UPDATE 등"
+        text before_state "JSON"
+        text after_state "JSON"
+        bigint actor_id
+        datetime created_at
+    }
+
+    %% ====================== 관계 정의 ======================
+    VENUE ||--o{ EVENT : "hosts"
+    EVENT ||--|{ SECTION : "has"
+    SECTION ||--|{ SEAT : "contains"
+
+    USER ||--o{ ORDER : "places"
+    USER ||--o{ BOOKING : "makes"
+    USER ||--o{ USER_COUPON : "owns"
+    USER ||--o{ CHAT_ROOM : "opens"
+
+    ORDER ||--o{ BOOKING : "contains"
+    ORDER ||--o{ PAYMENT : "has"
+    ORDER ||--o| USER_COUPON : "applied"
+
+    BOOKING ||--|{ TICKET : "generates"
+    BOOKING }o--|| SEAT : "reserves"
+    BOOKING }o--|| EVENT : "belongs_to"
+
+    ACTIVE_BOOKING ||--|| SEAT : "confirms"
+    ACTIVE_BOOKING ||--|| BOOKING : "references"
+
+    PAYMENT ||--o{ REFUND : "refunded"
+    PAYMENT ||--o{ PAYMENT_TRANSACTION_LOG : "records"
+
+    COUPON ||--o{ USER_COUPON : "issued_as"
+
+    CHAT_ROOM ||--|{ CHAT_MESSAGE : "contains"
+```
+
+---
+
+## 2. 테이블 설계 주요 결정 사항
+
+### 2-1. ORDER / BOOKING / TICKET 3계층 → ORDER_ITEM 삭제 후 2계층 + ACTIVE_BOOKING
+
+v5에서 ORDER_ITEM을 삭제하고, 그 역할을 BOOKING이 흡수했다.
+
+| 테이블 | 역할 | 변경 사항 |
+|--------|------|-----------|
+| `ORDER` | 결제 단위 묶음 | 변경 없음 |
+| `BOOKING` | 좌석 단위 점유 + 원가 스냅샷 | `order_id FK`, `original_price`, `event_id FK`, `status` 추가 |
+| `ACTIVE_BOOKING` | 확정된 예약만 보관 | **신규** — `UNIQUE(seat_id)`로 중복 확정 물리적 차단 |
+| `TICKET` | 입장 자격 증명 | 변경 없음 |
+
+**ORDER_ITEM 삭제 근거:**
+ORDER_ITEM은 ORDER ↔ BOOKING 연결 + 원가 스냅샷 역할을 했다.
+BOOKING이 `order_id`와 `original_price`를 직접 보유하면 동일 역할을 한 테이블로 커버할 수 있어 JOIN 뎁스가 줄어든다.
+3주 MVP 범위에서는 ORDER_ITEM의 추가적인 확장성보다 단순한 구조가 개발 속도에 유리하다.
+
+### 2-2. ACTIVE_BOOKING — MySQL 레벨 중복 확정 방어선
+
+MySQL은 `WHERE status='CONFIRMED'` 조건부 유니크 인덱스(Partial Index)를 지원하지 않는다.
+`ACTIVE_BOOKING` 테이블을 분리하고 `seat_id`를 PRIMARY KEY로 설정함으로써, 동일 좌석에 두 번째 CONFIRMED 행이 삽입되는 것을 DB 레벨에서 원천 차단한다.
+
+```sql
+CREATE TABLE active_booking (
+    seat_id    BIGINT PRIMARY KEY,           -- 좌석당 1건만 허용
+    booking_id BIGINT UNIQUE NOT NULL,       -- 어떤 예약이 확정됐는지
+    FOREIGN KEY (seat_id)    REFERENCES seat(seat_id),
+    FOREIGN KEY (booking_id) REFERENCES booking(booking_id)
+);
+```
+
+| 시점 | 처리 |
+|------|------|
+| 예매 확정 (웹훅 수신) | `ACTIVE_BOOKING INSERT` — seat_id 중복이면 즉시 에러 → 롤백 |
+| 예매 취소 | `ACTIVE_BOOKING DELETE` → `BOOKING.status = CANCELLED` |
+| 이력 | BOOKING 테이블에 모든 상태 변경 이력이 남음 |
+
+Redis 분산락이 1차 방어선이라면, ACTIVE_BOOKING의 PK 제약은 2차 방어선이다.
+락 구현 버그나 Redis 장애 상황에서도 중복 확정을 막는다.
+
+### 2-3. SEAT.status 삭제 — 상태 관리 책임 분리
+
+| 이전 (v4) | 이후 (v5) |
+|-----------|-----------|
+| `SEAT.status`: AVAILABLE / CONFIRMED | SEAT 테이블에 status 없음 |
+| ON_HOLD → Redis TTL | 동일 (변경 없음) |
+| CONFIRMED → `SEAT.status = CONFIRMED` | CONFIRMED → `ACTIVE_BOOKING` 행 존재 여부 |
+
+좌석 목록 조회 시 상태 판단 로직:
+
+```
+1. ACTIVE_BOOKING에 해당 seat_id가 존재 → CONFIRMED
+2. Redis hold:{eventId}:{seatId} 키가 존재 → ON_HOLD
+3. 그 외 → AVAILABLE
+```
+
+### 2-4. EVENT 테이블 변경
+
+| 컬럼 | 내용 |
+|------|------|
+| `round_number` 추가 | 다회차 공연 표현. "공연 1건 = 회차 1건" 원칙 유지. 동일 공연의 n번째 회차를 n개의 EVENT 행으로 표현 |
+| `status` 추가 | `ON_SALE`, `SOLD_OUT`, `CANCELLED`, `ENDED` — 이벤트 판매 상태를 명시적으로 관리 |
+
+다회차 표현 예시:
+
+```sql
+INSERT INTO event (title, venue_id, event_date, round_number, status) VALUES
+  ('레미제라블', 1, '2024-03-01', 1, 'ON_SALE'),
+  ('레미제라블', 1, '2024-03-02', 2, 'ON_SALE'),
+  ('레미제라블', 1, '2024-03-31', 31, 'ON_SALE');
+```
+
+### 2-5. BOOKING.event_id — 물리적 공간 구별
+
+같은 공연장(Venue)에서 날짜별로 다른 EVENT가 열릴 수 있다.
+SEAT는 물리적 좌석이라 공연장에 종속되므로, BOOKING만 보면 이 예약이 어떤 회차(EVENT)에 대한 것인지 알 수 없다.
+`BOOKING.event_id`는 이 문제를 해결하기 위한 역정규화다. Immutable 값이므로 부작용 없다.
+
+### 2-6. VENUE.capacity 삭제
+
+잔여 좌석 수는 `SEAT` 테이블 기반으로 동적 계산한다. `capacity` 고정값은 실제 좌석 수와 불일치할 가능성이 있어 삭제한다.
+
+### 2-7. COUPON.remaining_quantity — Redis와 MySQL 이중 관리
+
+선착순 쿠폰 발급 시 Redis에서 원자적으로 수량을 차감하지만, Redis 데이터 유실(재시작 등)에 대비해 MySQL에도 `remaining_quantity`를 Source of Truth로 보관한다.
+
+| 저장소 | 역할 | 이유 |
+|--------|------|------|
+| Redis | 실시간 수량 차감 (DECR) | 원자적 연산, 동시성 처리 |
+| MySQL `remaining_quantity` | 최종 수량 정합성 보장 | Redis 유실 시 복구 기준 |
+
+### 2-8. USER_COUPON.version — 낙관적 락으로 중복 사용 방지
+
+| 시점 | 제어 방식 | 이유 |
+|------|-----------|------|
+| 쿠폰 발급 | Redis 분산락 | 다수 동시 요청, 전체 로직 보호 |
+| 쿠폰 사용 | JPA `@Version` 낙관적 락 | 단일 쿠폰 사용은 충돌 빈도 낮음, DB 트랜잭션 범위 내 처리 충분 |
+
+---
+
+## 3. 인덱스 설계
+
+| 테이블 | 인덱스 대상 컬럼 | 타입 | 이유 |
+|--------|----------------|------|------|
+| EVENT | `(category, event_date)` | 복합 | 장르별 + 날짜 범위 검색 빈번 |
+| EVENT | `title` | 단일 | LIKE 검색 대상 |
+| BOOKING | `(seat_id, status)` | 복합 | 좌석별 예약 상태 조회 |
+| BOOKING | `user_id` | 단일 | 내 예매 내역 조회 |
+| BOOKING | `order_id` | 단일 | 주문별 예약 목록 조회 |
+| ORDER | `user_id` | 단일 | 내 주문 내역 조회 |
+| USER_COUPON | `(coupon_id, user_id)` | 복합 UK | 중복 발급 방지 (UNIQUE 제약 겸용) |
+| CHAT_MESSAGE | `(chat_room_id, chat_message_id DESC)` | 복합 | 커서 기반 최신 메시지 조회 |
+| CHAT_ROOM | `(user_id, status)` | 복합 | 사용자별/상태별 문의 조회 |
+
+---
+
+## 4. 도메인 경계 정리
+
+```
+[User Context]
+  └─ USER
+
+[Catalog Context]
+  └─ VENUE, EVENT, SECTION, SEAT
+
+[Booking/Order Context]
+  └─ ORDER, BOOKING, ACTIVE_BOOKING, TICKET
+
+[Payment Context]
+  └─ PAYMENT, REFUND, PAYMENT_TRANSACTION_LOG
+
+[Promotion Context]
+  └─ COUPON, USER_COUPON
+
+[CS Context]
+  └─ CHAT_ROOM, CHAT_MESSAGE
+
+[Audit Context]
+  └─ AUDIT_LOG
+```
+
+각 컨텍스트는 다른 컨텍스트의 엔티티를 직접 참조하지 않고 ID(FK)로만 참조한다.
+
+> **AUDIT_LOG는 모든 컨텍스트에서 독립적으로 기록**된다. 별도의 `AuditService`가 도메인 이벤트를 구독하거나, `@EntityListeners(AuditingEntityListener.class)`로 자동 기록한다.
