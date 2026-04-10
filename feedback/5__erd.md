@@ -268,25 +268,51 @@ INSERT INTO event (title, venue_id, event_date, round_number, status) VALUES
 SEAT는 물리적 좌석이라 공연장에 종속되므로, BOOKING만 보면 이 예약이 어떤 회차(EVENT)에 대한 것인지 알 수 없다.
 `BOOKING.event_id`는 이 문제를 해결하기 위한 역정규화다. Immutable 값이므로 부작용 없다.
 
+### 2-5-1. BOOKING.user_id — 조회 성능을 위한 역정규화 (M-04)
+
+`ORDER` 테이블에 이미 `user_id FK`가 있으므로, `BOOKING.user_id`는 `ORDER → user_id` 경로로 조회 가능한 중복 컬럼이다.
+그러나 아래 이유로 역정규화를 허용한다.
+
+| 항목 | 내용 |
+|------|------|
+| **조회 패턴** | `GET /api/users/me/bookings` — 내 예매 내역 조회 시 `ORDER JOIN` 없이 `BOOKING.user_id`로 직접 필터링 가능 |
+| **인덱스 활용** | `BOOKING(user_id)` 단일 인덱스로 `WHERE user_id = ?` 쿼리를 ORDER JOIN 없이 처리 |
+| **Immutable** | BOOKING 생성 시 user_id가 고정되므로 갱신 이상(Update Anomaly) 없음 |
+| **결론** | 읽기 성능 이득 > JOIN 제거로 인한 경미한 중복 허용 |
+
 ### 2-6. VENUE.capacity 삭제
 
 잔여 좌석 수는 `SEAT` 테이블 기반으로 동적 계산한다. `capacity` 고정값은 실제 좌석 수와 불일치할 가능성이 있어 삭제한다.
 
-### 2-7. COUPON.remaining_quantity — Redis와 MySQL 이중 관리
+### 2-7. COUPON.remaining_quantity — Redis와 MySQL 이중 관리 (m-06)
 
 선착순 쿠폰 발급 시 Redis에서 원자적으로 수량을 차감하지만, Redis 데이터 유실(재시작 등)에 대비해 MySQL에도 `remaining_quantity`를 Source of Truth로 보관한다.
 
 | 저장소 | 역할 | 이유 |
 |--------|------|------|
-| Redis | 실시간 수량 차감 (DECR) | 원자적 연산, 동시성 처리 |
+| Redis | 실시간 수량 차감 (DECR + Lua Script) | 원자적 연산, 동시성 처리 |
 | MySQL `remaining_quantity` | 최종 수량 정합성 보장 | Redis 유실 시 복구 기준 |
+
+**MySQL remaining_quantity 차감 시점 및 동기화 방식:**
+
+| 시점 | 처리 |
+|------|------|
+| Redis DECR 성공 직후 | `UPDATE coupon SET remaining_quantity = remaining_quantity - 1 WHERE coupon_id = ?` 즉시 실행 |
+| DB fallback 경로 (Redis 연결 실패) | `SELECT ... FOR UPDATE` 후 `remaining_quantity` 직접 차감 |
+| Redis 복구 후 | MySQL `remaining_quantity` 값을 기준으로 Redis 카운터 재초기화 (`SET coupon:stock:{couponId} {remaining_quantity}`) |
+
+> **주의:** Redis DECR 성공 후 MySQL UPDATE가 실패하면 Redis와 MySQL 간 수량 불일치가 발생한다.
+> 이 경우 MySQL `remaining_quantity`가 실제보다 1 많은 상태가 되므로,
+> 장애 복구 시 Redis를 MySQL 기준으로 재초기화하여 정합성을 맞춘다.
+> (Redis 카운터가 MySQL보다 1 적은 것은 발급 수 과소 → 허용 가능한 방향의 오차)
 
 ### 2-8. USER_COUPON.version — 낙관적 락으로 중복 사용 방지
 
 | 시점 | 제어 방식 | 이유 |
 |------|-----------|------|
-| 쿠폰 발급 | Redis 분산락 | 다수 동시 요청, 전체 로직 보호 |
-| 쿠폰 사용 | JPA `@Version` 낙관적 락 | 단일 쿠폰 사용은 충돌 빈도 낮음, DB 트랜잭션 범위 내 처리 충분 |
+| 쿠폰 발급 | Redis Atomic DECR + Lua Script (분산락 미사용 — L-01 대응) | DECR 자체가 원자적이므로 추가 락 불필요 |
+| 쿠폰 사용 (예매 내) | `lock:user-coupon-use:{userCouponId}` 분산락 + `@Version` 낙관적 락 | 예매 플로우 내 쿠폰 사용은 중복 사용 방지 필요 |
+| 쿠폰 복원 (취소 시) | `SELECT ... FOR UPDATE` 비관적 락 (C-03 대응) | 복원 중 동일 쿠폰 재사용 시도와의 충돌 방지 |
 
 ---
 

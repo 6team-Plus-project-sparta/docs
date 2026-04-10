@@ -1,8 +1,18 @@
 # 📡 API 명세서 — TicketFlow
 
-> **문서 버전:** v1.0
-> **최종 수정일:** 2026-04-09
-> **연결 문서:** 3. 유스케이스 명세서, 4. 기능 명세서, 5. ERD
+> **문서 버전:** v4.0
+> **최종 수정일:** 2026-04-10
+> **변경 사유:**
+> - C-01: holdToken Redis 역조회 키 구조 추가 (A안 — `holdToken:{uuid}` 키)
+> - C-02: 쿠폰 발급 503 케이스를 "Redis 연결 자체 실패"로 재정의
+> - C-03: 주문 취소 시 USER_COUPON 복원에 SELECT ... FOR UPDATE 명시
+> - M-01: GET /api/orders/{orderId} 주문 상세 조회 API 추가
+> - M-02: user-holds Set → user-hold-count:{userId} INCR/DECR 방식으로 변경
+> - M-03: FN-BK-01 비고란 FAILED/PENDING BOOKING 재사용 허용 명시
+> - m-01: POST /api/admin/events Request Body에 saleStartAt, saleEndAt 추가
+> - m-04: POST /api/search/popular/click 인증 필수, 동일 검색어 1시간 1회 제한
+> - m-05: 서버 타임존 KST(UTC+9) 기준 명시
+> **연결 문서:** 3. 유스케이스 명세서, 4. 기능 명세서, 5. ERD v7.0
 
 ---
 
@@ -29,6 +39,8 @@
 ```
 
 **WebSocket:** `ws://api.ticketflow.io/ws-stomp` (STOMP 프로토콜)
+
+**서버 타임존:** 모든 `datetime` 필드는 **KST(UTC+9)** 기준으로 저장하고 반환한다. (m-05 대응)
 
 ---
 
@@ -221,12 +233,15 @@
   "category": "CONCERT",
   "venueId": 1,
   "eventDate": "2026-05-10T18:00:00",
+  "saleStartAt": "2026-04-15T12:00:00",
+  "saleEndAt": "2026-05-10T17:00:00",
+  "roundNumber": 1,
   "description": "세븐틴의 전국 투어 마지막 서울 공연",
   "thumbnailUrl": "https://cdn.ticketflow.io/events/seventeen-2026.jpg",
   "sections": [
-    { "sectionName": "A구역", "price": 110000, "totalSeats": 200 },
-    { "sectionName": "B구역", "price": 88000, "totalSeats": 350 },
-    { "sectionName": "스탠딩", "price": 132000, "totalSeats": 150 }
+    { "sectionName": "A구역", "price": 110000, "rowCount": 10, "colCount": 20 },
+    { "sectionName": "B구역", "price": 88000, "rowCount": 14, "colCount": 25 },
+    { "sectionName": "스탠딩", "price": 132000, "rowCount": 5, "colCount": 30 }
   ]
 }
 ```
@@ -248,6 +263,9 @@
 
 // 400 — 과거 일시
 { "status": 400, "code": "INVALID_EVENT_DATE", "message": "이벤트 일시는 현재 이후여야 합니다." }
+
+// 400 — 판매 일시 오류
+{ "status": 400, "code": "INVALID_SALE_DATE", "message": "예매 오픈/마감 시각이 올바르지 않습니다. (saleStartAt < saleEndAt < eventDate)" }
 ```
 
 ---
@@ -341,7 +359,7 @@
 | GET | `/api/v1/events/search` | 이벤트 검색 v1 (캐시 없음, 성능 기준선) | `?keyword&category&startDate&endDate&minPrice&maxPrice&page&size&sort` | `200 Page<EventSummary>` | 🔓 | UC-005 |
 | GET | `/api/v2/events/search` | 이벤트 검색 v2 💾 (Caffeine → Redis Cache-Aside) | 동일 | `200 Page<EventSummary>` + `X-Cache: HIT/MISS` | 🔓 | UC-005 |
 | GET | `/api/search/popular` | 인기 검색어 Top 10 💾 | — | `200 List<PopularKeyword>` | 🔓 | UC-006 |
-| POST | `/api/search/popular/click` | 인기 검색어 클릭 점수 반영 (ZINCRBY) | `{ keyword }` | `200` | 🔓 | UC-006 |
+| POST | `/api/search/popular/click` | 인기 검색어 클릭 점수 반영 (ZINCRBY) | `{ keyword }` | `200` | 🔐 | UC-006 |
 
 ### GET /api/v1/events/search
 
@@ -436,8 +454,14 @@ Content-Type: application/json
 
 ### POST /api/search/popular/click
 
+> 🔐 **JWT 인증 필수** — 인증된 사용자만 클릭 점수 반영 가능 (어뷰징 방지)
 > 인기 검색어 목록에서 키워드를 클릭할 때 서버 사이드에서 Redis ZSet 점수를 증가시킨다.
-> `ZINCRBY search-keywords 1 {keyword}` 호출
+>
+> **클릭 어뷰징 방지 (m-04):**
+> 동일 사용자가 동일 검색어를 반복 클릭해도 **1시간 내 최대 1회만** 점수에 반영된다.
+> 구현: Redis SET  EX 3600 (NX 옵션 — 이미 존재하면 ZINCRBY 생략)
+> 
+>
 > 검색창에 직접 입력하는 경우는 검색 API 호출 시 서버에서 자동으로 ZINCRBY를 처리하므로 이 API를 별도 호출할 필요 없음.
 > **이 API는 "인기 검색어 클릭" 이벤트 전용**이다.
 
@@ -494,7 +518,18 @@ Content-Type: application/json
 
 > **동시성 제어:** Redis 분산락 (`lock:seat:{eventId}:{seatId}`, TTL 3초, Lua Script 원자적 해제)
 > **Fail Fast 전략:** 락 획득 실패 시 즉시 409 반환 (재시도 없음 — 티켓팅 UX상 즉각 피드백 필수)
-> **어뷰징 방지:** 사용자당 동시 Hold 최대 4석 (`user-holds:{userId}` SCARD)
+> **어뷰징 방지:** 사용자당 동시 Hold 최대 4석 (`user-hold-count:{userId}` INCR/DECR, TTL 300초)
+>
+> **Hold 성공 시 Redis 저장 구조 (C-01 A안):**
+> ```
+> SET  hold:{eventId}:{seatId}    = {userId}                       (TTL 300초)
+> SET  holdToken:{uuid}           = "{eventId}:{seatId}:{userId}"  (TTL 300초)
+> INCR user-hold-count:{userId}                                    (TTL 300초, 키 없으면 신규 생성)
+> ```
+> `holdToken:{uuid}` 키를 통해 주문 생성(`POST /api/orders`) 시 holdToken → (eventId, seatId, userId) 역조회가 가능하다.
+> TTL은 `hold:{eventId}:{seatId}` 와 동일하게 관리하며, Hold 해제 또는 TTL 만료 시 함께 삭제된다.
+> Hold 만료 시 `user-hold-count:{userId}` DECR은 TTL 자연 만료로 처리하므로 별도 Keyspace Notification이 필요 없다.
+> (count 키 TTL은 Hold 키 TTL과 동일하게 300초. Hold 연장 시 count 키 TTL도 함께 연장)
 
 **Response 200 OK**
 ```json
@@ -549,8 +584,65 @@ Content-Type: application/json
 | Method | Endpoint | 설명 | Request | Response | 인증 | 관련 UC |
 |--------|----------|------|---------|----------|------|---------|
 | POST | `/api/orders` | 주문 생성 (티켓 예매 요청) ⚠️ | `{ holdTokens[], couponId? }` | `200 { orderId, status, paymentAmount }` | 🔐 | UC-008 |
+| GET | `/api/orders/{orderId}` | 주문 상세 조회 | — | `200 OrderDetail` | 🔐 | UC-008, UC-010 |
 | POST | `/api/mock-pg/webhook` | Mock PG 웹훅 수신 (주문 확정) ⚠️ | `{ orderId, paymentStatus, paymentKey, paidAmount }` | `200` | 🔓 | UC-008 |
 | POST | `/api/orders/{orderId}/cancel` | 주문 취소 | — | `200` | 🔐 | UC-009 |
+
+### GET /api/orders/{orderId}
+
+> 주문 생성 후 결제 결과를 확인하거나, 특정 주문의 상세 정보를 조회할 때 사용한다.
+> 결제 완료 후 클라이언트가 PENDING → CONFIRMED 전환을 확인하기 위한 폴링 용도로도 활용 가능하다.
+> **서버 타임존:** 모든 datetime 필드는 KST(UTC+9) 기준으로 반환한다.
+
+**Response 200 OK**
+```json
+{
+  "orderId": 101,
+  "status": "CONFIRMED",
+  "totalAmount": 330000,
+  "discountAmount": 5000,
+  "finalAmount": 325000,
+  "bookings": [
+    {
+      "bookingId": 201,
+      "seatInfo": "A구역 A열 15번",
+      "originalPrice": 110000,
+      "ticketCode": "TF-2026-A015-XYZ1",
+      "status": "CONFIRMED"
+    },
+    {
+      "bookingId": 202,
+      "seatInfo": "A구역 A열 16번",
+      "originalPrice": 110000,
+      "ticketCode": "TF-2026-A016-XYZ2",
+      "status": "CONFIRMED"
+    }
+  ],
+  "couponUsed": {
+    "userCouponId": 10,
+    "couponName": "신규 가입 5,000원 할인",
+    "discountAmount": 5000
+  },
+  "payment": {
+    "paymentKey": "PG-KEY-2026040900001",
+    "method": "CARD",
+    "paidAmount": 325000,
+    "paidAt": "2026-04-09T20:12:00"
+  },
+  "createdAt": "2026-04-09T20:05:00"
+}
+```
+
+**Error Cases**
+```json
+// 403 — 본인 주문 아님
+{ "status": 403, "code": "ORDER_NOT_OWNED", "message": "본인의 주문만 조회할 수 있습니다." }
+
+// 404 — 주문 없음
+{ "status": 404, "code": "ORDER_NOT_FOUND", "message": "존재하지 않는 주문입니다." }
+```
+
+---
 
 ### POST /api/orders ⚠️
 
@@ -559,6 +651,7 @@ Content-Type: application/json
 > **Hold TTL 연장 (L-02 대응):** 주문 생성 성공 시 모든 Hold 키의 TTL을 +5분 연장한다.
 > 이로써 "주문 생성 → PG 웹훅 도착" 사이의 타이밍 갭 문제를 해결한다.
 > (Redis `EXPIRE hold:{eventId}:{seatId} 300` 재실행)
+> **holdToken 역조회 (C-01 A안):** 서버는 `holdToken:{uuid}` Redis 키로 `{eventId}:{seatId}:{userId}`를 역조회하여 Hold 유효성 검증
 > Hold 토큰 최대 4개, 단일 ORDER로 묶어 처리
 
 **Request**
@@ -751,8 +844,8 @@ Content-Type: application/json
 // 400 — 발급 시작 전
 { "status": 400, "code": "COUPON_NOT_STARTED", "message": "쿠폰 발급 시간이 아닙니다. (발급 시작: 2026-04-10T12:00:00)" }
 
-// 503 — 락 획득 최종 실패 (3회 재시도 후)
-{ "status": 503, "code": "SERVICE_UNAVAILABLE", "message": "요청이 많아 처리할 수 없습니다. 잠시 후 다시 시도해주세요." }
+// 503 — Redis 연결 자체 실패 (DB fallback도 불가한 경우)
+{ "status": 503, "code": "SERVICE_UNAVAILABLE", "message": "현재 서비스 이용이 어렵습니다. 잠시 후 다시 시도해주세요." }
 ```
 
 ---
@@ -1004,16 +1097,17 @@ heart-beat:10000,10000
 | 15 | DELETE | `/api/events/{eventId}/seats/{seatId}/hold` | Hold 해제 | 🔐 | |
 | 16 | POST | `/api/orders` | 주문 생성 (예매) | 🔐 | ⚠️ 쿠폰 락 |
 | 17 | POST | `/api/mock-pg/webhook` | PG 웹훅 수신 | 🔓 | ⚠️ 멱등성 보장 |
-| 18 | POST | `/api/orders/{orderId}/cancel` | 주문 취소 | 🔐 | |
-| 19 | POST | `/api/admin/coupons` | 쿠폰 등록 | 🔐👑 | |
-| 20 | POST | `/api/coupons/{couponId}/issue` | 쿠폰 발급 | 🔐 | ⚠️ Redis Atomic |
-| 21 | POST | `/api/chat/rooms` | 채팅방 생성 | 🔐 | |
-| 22 | GET | `/api/chat/rooms/{chatRoomId}/messages` | 채팅 이력 | 🔐 | 커서 페이징 |
-| 23 | PATCH | `/api/chat/rooms/{chatRoomId}/close` | 채팅방 종료 | 🔐 | |
+| 18 | GET | `/api/orders/{orderId}` | 주문 상세 조회 | 🔐 | 결제 결과 폴링 용도 |
+| 19 | POST | `/api/orders/{orderId}/cancel` | 주문 취소 | 🔐 | |
+| 20 | POST | `/api/admin/coupons` | 쿠폰 등록 | 🔐👑 | |
+| 21 | POST | `/api/coupons/{couponId}/issue` | 쿠폰 발급 | 🔐 | ⚠️ Redis Atomic |
+| 22 | POST | `/api/chat/rooms` | 채팅방 생성 | 🔐 | |
+| 23 | GET | `/api/chat/rooms/{chatRoomId}/messages` | 채팅 이력 | 🔐 | 커서 페이징 |
+| 24 | PATCH | `/api/chat/rooms/{chatRoomId}/close` | 채팅방 종료 | 🔐 | |
 | WS | STOMP | `ws://.../ws-stomp` | 실시간 채팅 | 🔐 JWT | STOMP 프로토콜 |
-| 24 | POST | `/api/search/popular/click` | 인기 검색어 클릭 점수 반영 | 🔓 | ZINCRBY |
-| 25 | GET | `/api/admin/chat/rooms` | 관리자 채팅방 목록 조회 | 🔐👑 | 초기 로딩용 |
-| 26 | PATCH | `/api/admin/bookings/{bookingId}/confirm` | 예매 수동 확정 | 🔐👑 | ⚠️ FOR UPDATE |
+| 25 | POST | `/api/search/popular/click` | 인기 검색어 클릭 점수 반영 | 🔐 | ZINCRBY, 1시간 1회 제한 |
+| 26 | GET | `/api/admin/chat/rooms` | 관리자 채팅방 목록 조회 | 🔐👑 | 초기 로딩용 |
+| 27 | PATCH | `/api/admin/bookings/{bookingId}/confirm` | 예매 수동 확정 | 🔐👑 | ⚠️ FOR UPDATE |
 
 ---
 
@@ -1033,7 +1127,7 @@ heart-beat:10000,10000
 | 쿠폰 사용 | 분산락 + `@Version` 낙관적 락 | 예외 발생 시 트랜잭션 롤백 | 쿠폰 1장 사용은 충돌 빈도 낮음. DB 트랜잭션 범위 내 처리 충분 |
 | 웹훅 확정 | 멱등성 키 (`orderId`) | 중복 수신 시 200 즉시 반환 | PG는 웹훅을 여러 번 보낼 수 있음. 중복 처리 방지 필수 |
 | 수동 예매 확정 | `SELECT ... FOR UPDATE` 비관적 락 | 409 SEAT_ALREADY_CONFIRMED | 관리자 수동 처리 중 자동 취소 트랜잭션과의 충돌 방지 |
-| 주문 취소 | `SELECT ... FOR UPDATE` 비관적 락 | 단일 트랜잭션 내 ACTIVE_BOOKING DELETE → BOOKING/ORDER CANCELLED | 취소 중 다른 새 예매 확정 트랜잭션과의 충돌 방지 |
+| 주문 취소 | `SELECT ... FOR UPDATE` 비관적 락 (BOOKING, ORDER, ACTIVE_BOOKING, USER_COUPON 행 모두 잠금) | 단일 트랜잭션 내 ACTIVE_BOOKING DELETE → BOOKING/ORDER CANCELLED → USER_COUPON ISSUED 복원 | 취소 중 웹훅 확정·수동 확정·쿠폰 재사용 시도와의 충돌 방지 (C-03 대응) |
 
 ### REST 원칙 준수 포인트
 - 취소는 `DELETE /api/orders/{orderId}` 대신 `POST /api/orders/{orderId}/cancel` — 취소는 상태 전이(CANCELLED)를 유발하는 복잡한 비즈니스 로직(PG 환불, 좌석 복원 등)을 수반하므로, 단순 삭제(`DELETE`)로 표현하기 부적절
