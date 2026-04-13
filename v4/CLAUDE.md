@@ -155,10 +155,24 @@ domain/{도메인}/
 
 ## 분산락 공통 모듈 (global/lock)
 
-- `DistributedLockService`: `tryLock(key, uuid, ttlSeconds)`, `unlock(key, uuid)`
+- `DistributedLockProvider` (인터페이스): `tryLock(key, value, ttlSeconds)`, `unlock(key, value)`
+- `LettuceDistributedLock`: [필수] SETNX + Lua Script 구현체
+- `RedissonDistributedLock`: [도전] RLock.tryLock() 구현체
+- `LockConfig`: `@ConditionalOnProperty`로 구현체 Bean 전환
+  - `lock.provider=lettuce` → `LettuceDistributedLock` (기본값, `matchIfMissing=true`)
+  - `lock.provider=redisson` → `RedissonDistributedLock` + `RedissonClient` Bean 등록
 - `LuaScripts`:
   - `UNLOCK_SCRIPT`: UUID 검증 후 DEL (본인 락만 해제)
   - `COUPON_DECR_SCRIPT`: DECR 후 < 0이면 INCR 원상복구 후 -1 반환
+
+**캐시·락 Feature Flag 대칭 구조:**
+
+```yaml
+cache:
+  provider: caffeine   # caffeine | redis    (ADR-006)
+lock:
+  provider: lettuce    # lettuce  | redisson (ADR-002)
+```
 
 ---
 

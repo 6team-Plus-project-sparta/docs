@@ -71,20 +71,21 @@ AccessToken 만료(1시간) 전 강제 무효화 불가. 로그아웃 시 클라
 
 ---
 
-## ADR-002. Lettuce SETNX 분산락(필수) + Redisson AOP(도전) 이중 전략
+## ADR-002. Lettuce SETNX 분산락(필수) + Redisson AOP(도전) — Feature Flag 전환 전략
 
 | 항목 | 내용 |
 |------|------|
 | **날짜** | 2026-04-08 |
-| **상태** | 승인됨 |
+| **최종 수정** | 2026-04-13 |
+| **상태** | 승인됨 (Feature Flag 전략 추가 반영) |
 | **결정자** | 팀 전원 |
 | **관련 기능** | FN-SEAT-02, FN-BK-01, FN-BK-02, FN-CPN-02 |
 
 ### 컨텍스트
 
-인기 공연 오픈 시 수천 명이 동시에 동일 좌석을 클릭한다. 1명만 예매에 성공해야 하고 나머지는 즉시 실패 응답을 받아야 한다. 동시성 제어 방식을 결정해야 한다.
+인기 공연 오픈 시 수천 명이 동시에 동일 좌석을 클릭한다. 1명만 예매에 성공해야 하고 나머지는 즉시 실패 응답을 받아야 한다. 동시성 제어 방식을 결정하고, 도전 구현(Redisson)으로의 전환을 안전하게 수행하는 방법도 함께 결정해야 한다.
 
-### 비교
+### 분산락 전략 비교
 
 | 전략 | 정합성 | 성능 | 구현 난이도 | 분산 환경 | UX |
 |------|--------|------|------------|-----------|-----|
@@ -93,22 +94,200 @@ AccessToken 만료(1시간) 전 강제 무효화 불가. 로그아웃 시 클라
 | Lettuce SETNX | 확실 | DB 접근 전 차단 | 중간 | 가능 | 즉시 실패 ✅ |
 | Redisson | 확실 | DB 접근 전 차단 | 중간 (AOP) | 가능 | 즉시 실패 ✅ |
 
+### 전환 전략 비교
+
+| 전략 | 설명 | 장점 | 단점 |
+|------|------|------|------|
+| **코드 직접 교체** | Lettuce 코드를 Redisson으로 덮어씀 | 단순 | 롤백 시 Git 되돌리기 필요, 전환 중 위험 |
+| **Feature Flag** ✅ | `lock.provider` 설정값으로 Bean 전환 | 코드 변경 없이 전환·롤백, 캐시 전략과 동일 패턴 | 인터페이스 추상화 구현 필요 |
+
 ### 결정
 
-**Lettuce SETNX(필수) → Redisson AOP 리팩토링(도전)** 순차 적용
+**① Lettuce SETNX(필수) → ② Redisson AOP(도전) 순차 적용 + Feature Flag로 무중단 전환**
+
+캐시의 `cache.provider: caffeine | redis` 패턴과 동일하게, 락도 `lock.provider: lettuce | redisson` 설정 한 줄로 전환한다.
+
+```yaml
+# application.yml
+lock:
+  provider: lettuce   # 필수 구현 완료 후 → redisson 으로 변경만으로 전환
+```
+
+### Feature Flag 구현 구조
+
+**1단계: 공통 인터페이스 정의 (`DistributedLockProvider`)**
+
+```java
+// global/lock/DistributedLockProvider.java
+public interface DistributedLockProvider {
+    /**
+     * 분산락 획득 시도 (Fail Fast — waitTime=0)
+     * @return true: 획득 성공 / false: 획득 실패
+     */
+    boolean tryLock(String key, String value, long ttlSeconds);
+
+    /**
+     * 분산락 해제 (본인 락만 해제 보장)
+     */
+    void unlock(String key, String value);
+}
+```
+
+**2단계: 구현체 두 개 (Lettuce / Redisson)**
+
+```java
+// global/lock/LettuceDistributedLock.java
+@Component("lettuceLockProvider")
+@RequiredArgsConstructor
+public class LettuceDistributedLock implements DistributedLockProvider {
+    private final StringRedisTemplate redisTemplate;
+
+    @Override
+    public boolean tryLock(String key, String value, long ttlSeconds) {
+        return Boolean.TRUE.equals(
+            redisTemplate.opsForValue()
+                .setIfAbsent(key, value, Duration.ofSeconds(ttlSeconds))
+        );
+    }
+
+    @Override
+    public void unlock(String key, String value) {
+        // Lua Script — UUID 검증 후 원자적 DEL (본인 락만 해제)
+        redisTemplate.execute(LuaScripts.UNLOCK_SCRIPT,
+            List.of(key), value);
+    }
+}
+
+// global/lock/RedissonDistributedLock.java
+@Component("redissonLockProvider")
+@RequiredArgsConstructor
+public class RedissonDistributedLock implements DistributedLockProvider {
+    private final RedissonClient redissonClient;
+
+    @Override
+    public boolean tryLock(String key, String value, long ttlSeconds) {
+        try {
+            RLock lock = redissonClient.getLock(key);
+            return lock.tryLock(0, ttlSeconds, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    @Override
+    public void unlock(String key, String value) {
+        RLock lock = redissonClient.getLock(key);
+        if (lock.isHeldByCurrentThread()) {
+            lock.unlock();
+        }
+    }
+}
+```
+
+**3단계: Feature Flag로 Bean 선택 (`LockConfig`)**
+
+```java
+// global/config/LockConfig.java
+@Configuration
+public class LockConfig {
+
+    // lock.provider=lettuce (기본값) → LettuceDistributedLock 활성화
+    @Bean
+    @Primary
+    @ConditionalOnProperty(name = "lock.provider", havingValue = "lettuce", matchIfMissing = true)
+    public DistributedLockProvider lettuceLockProvider(StringRedisTemplate redisTemplate) {
+        return new LettuceDistributedLock(redisTemplate);
+    }
+
+    // lock.provider=redisson → RedissonDistributedLock 활성화
+    @Bean
+    @Primary
+    @ConditionalOnProperty(name = "lock.provider", havingValue = "redisson")
+    public DistributedLockProvider redissonLockProvider(RedissonClient redissonClient) {
+        return new RedissonDistributedLock(redissonClient);
+    }
+
+    // Redisson 클라이언트 — lock.provider=redisson일 때만 생성
+    @Bean
+    @ConditionalOnProperty(name = "lock.provider", havingValue = "redisson")
+    public RedissonClient redissonClient(@Value("${spring.data.redis.host}") String host,
+                                         @Value("${spring.data.redis.port}") int port) {
+        Config config = new Config();
+        config.useSingleServer()
+              .setAddress("redis://" + host + ":" + port);
+        return Redisson.create(config);
+    }
+}
+```
+
+**4단계: 사용 측은 인터페이스만 바라봄 — 전환 시 코드 변경 없음**
+
+```java
+// booking/facade/HoldLockFacade.java
+@Component
+@RequiredArgsConstructor
+public class HoldLockFacade {
+    private final DistributedLockProvider lockProvider; // Lettuce든 Redisson이든 무관
+
+    public HoldResponseDto hold(Long eventId, Long seatId, Long userId) {
+        String lockKey = "lock:seat:" + eventId + ":" + seatId;
+        String uuid    = UUID.randomUUID().toString();
+
+        if (!lockProvider.tryLock(lockKey, uuid, 3)) {
+            throw new ConflictException(ErrorCode.SEAT_LOCK_FAILED);
+        }
+        try {
+            return holdService.processHold(eventId, seatId, userId); // @Transactional
+        } finally {
+            lockProvider.unlock(lockKey, uuid); // COMMIT 이후 해제 보장
+        }
+    }
+}
+```
+
+### 전환 절차
 
 ```
 [1단계] 동시성 테스트 작성 → 실패 확인
-[2단계] Lettuce SETNX 구현 → 테스트 통과 (필수)
-[3단계] Redisson @RedisLock AOP로 리팩토링 (도전)
+        └ DistributedLockProvider 인터페이스 및 LettuceDistributedLock 구현
+        └ LockConfig (lock.provider=lettuce, matchIfMissing=true) 등록
+
+[2단계] Lettuce 구현 → 테스트 통과 확인 (필수)
+        └ lock.provider: lettuce (기본값) 상태로 운영
+
+        ↓ 도전 구현
+
+[3단계] Redisson AOP 구현
+        └ RedissonDistributedLock 구현체 추가
+        └ LockConfig에 redisson Bean 등록
+        └ @RedisLock 커스텀 어노테이션 + @Aspect 구조 추가 (선택 — AOP 적용 시)
+        └ 동일 테스트 코드로 Redisson 검증
+
+[4단계] Feature Flag로 전환
+        └ application.yml: lock.provider: lettuce → redisson
+        └ 코드 변경 없음, 재배포만으로 전환
+        └ 문제 발생 시 → lock.provider: lettuce 로 즉시 롤백
+```
+
+### 캐시 전략과 대칭 구조
+
+```yaml
+# application.yml — 두 Feature Flag 나란히 관리
+cache:
+  provider: caffeine   # caffeine | redis    (ADR-006)
+lock:
+  provider: lettuce    # lettuce  | redisson (ADR-002)
 ```
 
 ### 이유
 
-1. **발제 요구사항**: Lettuce 필수 구현 → Redisson 도전 순서가 명시되어 있음
-2. **Fail Fast**: `waitTime=0`으로 대기 없이 즉시 실패 → 티켓팅 UX에 최적
-3. **이중 방어선**: Redis 분산락(1차) + ACTIVE_BOOKING PK 제약(2차) → Redis 장애 시에도 중복 확정 차단
-4. **구현 학습**: Lettuce SETNX + Lua Script → Redisson AOP 패턴의 발전 과정을 직접 체험
+1. **발제 요구사항**: Lettuce 필수 구현 → Redisson 도전 순서 준수
+2. **안전한 전환**: yml 한 줄 변경으로 전환·롤백 — Git 되돌리기 불필요
+3. **Fail Fast 유지**: 인터페이스 계약(`waitTime=0`) 양쪽 구현체 모두 동일하게 적용
+4. **테스트 재사용**: 동일 동시성 테스트 코드로 Lettuce·Redisson 양쪽 모두 검증 가능
+5. **이중 방어선 유지**: Redis 분산락(1차) + ACTIVE_BOOKING PK 제약(2차) — 락 구현체 교체와 무관하게 유지
+6. **캐시와 패턴 일관성**: `cache.provider`와 동일한 `@ConditionalOnProperty` 패턴 → 팀 내 학습 부하 최소화
 
 ### 트레이드오프
 
@@ -117,6 +296,8 @@ AccessToken 만료(1시간) 전 강제 무효화 불가. 로그아웃 시 클라
 | Redis 장애 | ACTIVE_BOOKING PK 제약이 최후 방어선으로 동작 |
 | leaseTime(3초) 초과 | hold 키 존재 여부로 2차 차단 |
 | 단일 EC2 → 스케일아웃 | Redisson은 Redis Cluster 연결만으로 분산 환경 대응 |
+| Redisson 전환 후 문제 | `lock.provider: lettuce` 한 줄로 즉시 롤백 |
+| Lettuce·Redisson 클라이언트 공존 | `RedissonClient` Bean은 `lock.provider=redisson`일 때만 생성 — 불필요한 커넥션 없음 |
 
 ---
 
@@ -602,3 +783,12 @@ Hold 성공 시 Redis 저장:
 1. **API 하위 호환**: `holdTokens[]` Request 구조 유지 → 클라이언트 변경 없음
 2. **TTL 일치**: holdToken 키 TTL = hold 키 TTL → 토큰 만료 = Hold 만료로 자연스럽게 동기화
 3. **구현 단순**: 별도 DB 조회 없이 Redis 단일 GET으로 역조회 완료
+
+---
+
+## 주요 변경 이력
+
+| 버전 | ADR | 변경 내용 | 일자 |
+|------|-----|----------|------|
+| v1.0 | 전체 | 최초 작성 | 2026-04-10 |
+| v1.1 | ADR-002 | Lettuce → Redisson 전환 전략을 코드 직접 교체 방식에서 **Feature Flag (`lock.provider`) 방식**으로 개정. `DistributedLockProvider` 인터페이스 추상화, `LockConfig` Bean 전환 구조, 전환 절차 추가 | 2026-04-13 |
